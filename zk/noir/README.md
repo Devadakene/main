@@ -79,6 +79,8 @@ Key properties:
   are revoked.
 - **Domain binding**: `HARPOCRATES_REVOCATION_V1` prevents cross-version replay.
 
+Spec: [`docs/zk-revocation-witness-spec.md`](../../docs/zk-revocation-witness-spec.md).
+
 ### `revocation_witness_helper`
 
 Helper circuit that derives `credential_root` / `nullifier` and Merkle root
