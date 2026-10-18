@@ -5,6 +5,8 @@ on:
     paths:
       - "contracts/**"
       - "zk/vectors/**"
+      - "frontend/src/generated/**"
+      - "devx/contract_bindings.py"
       - ".github/workflows/contracts-ci.yml"
   push:
     branches:
@@ -12,6 +14,8 @@ on:
     paths:
       - "contracts/**"
       - "zk/vectors/**"
+      - "frontend/src/generated/**"
+      - "devx/contract_bindings.py"
       - ".github/workflows/contracts-ci.yml"
 
 permissions:
@@ -69,6 +73,14 @@ jobs:
       - name: Enforce contract Wasm size budget (#346)
         working-directory: .
         run: python3 devx/wasm_size_budget.py --check
+
+      - name: Test contract bindings drift checker
+        working-directory: .
+        run: python3 devx/test_contract_bindings.py
+
+      - name: Fail on contract bindings drift
+        working-directory: .
+        run: python3 devx/contract_bindings.py --check
 
       - name: Upload test failure log
         if: failure()
