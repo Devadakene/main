@@ -4,6 +4,7 @@ import os
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from register_auth import ScopedKey, parse_scoped_keys
 
@@ -27,6 +28,7 @@ class AppConfig:
     ratelimit_register: str
     ratelimit_upload_session: str
     ratelimit_upload_chunk: str
+    ratelimit_verify: str
     release_id: str
     release_network: str
     metrics_enabled: bool
@@ -52,12 +54,52 @@ class AppConfig:
     verifier_cache_max_size: int
     verifier_cache_positive_ttl_seconds: float
     verifier_cache_negative_ttl_seconds: float
+    # Stego process pool and resource limits
+    stego_memory_limit_bytes: int = 536_870_912
+    stego_cpu_limit_seconds: int = 60
+    stego_pool_max_workers: int = 4
     # External evidence fetch safety bounds
-    external_fetch_connect_timeout_seconds: float
-    external_fetch_read_timeout_seconds: float
-    external_fetch_max_response_bytes: int
+    external_fetch_connect_timeout_seconds: float = 5.0
+    external_fetch_read_timeout_seconds: float = 10.0
+    external_fetch_max_response_bytes: int = 65_536
     # Owner-scoped credentials: each key may only register its own sourceAddress.
     register_scoped_keys: tuple[ScopedKey, ...] = ()
+    job_file_ttl_seconds: int = 86_400
+    # Processing deadlines; 0 disables each one (the default, today's behaviour).
+    job_queue_ttl_seconds: int = 0
+    job_execution_timeout_seconds: int = 0
+    retention_blob_gc_enabled: bool = False
+    retention_unreferenced_blobs_enabled: bool = False
+    retention_dry_run: bool = False
+    # Two-phase deletion receipts for retained evidence (audit trail only;
+    # never stores media bytes or plaintext keys).
+    deletion_receipts_enabled: bool = False
+    deletion_receipt_salt: str | None = None
+    deletion_receipt_ttl_seconds: int = 2_592_000
+    registration_reconcile_state_dir: str = ""
+    stellar_network_passphrase: str = ""
+
+    def redacted_summary(self) -> dict[str, object]:
+        """Return a dict representation of the config where secret fields are redacted.
+
+        Secret fields (API keys, endpoints, tokens) are replaced with a boolean indicating
+        presence (True if set, False otherwise). Non-secret fields retain their original
+        values.
+        """
+        from dataclasses import asdict
+
+        secret_fields = {
+            "metrics_token",
+            "tracing_endpoint",
+            "register_api_key",
+            "register_api_key_previous",
+            "deletion_receipt_salt",
+        }
+        raw = asdict(self)
+        for field in secret_fields:
+            if field in raw:
+                raw[field] = raw[field] is not None
+        return raw
 
 
 def load_config() -> AppConfig:
@@ -80,6 +122,11 @@ def load_config() -> AppConfig:
             "REGISTER_API_KEY_PREVIOUS is required when REGISTER_API_KEY_PREVIOUS_EXPIRES is set"
         )
 
+    deletion_receipts_enabled = _bool_env("HARPOCRATES_DELETION_RECEIPTS_ENABLED", False)
+    deletion_receipt_salt = _str_env("DELETION_RECEIPT_SALT")
+    if deletion_receipts_enabled and deletion_receipt_salt is None:
+        raise RuntimeError("DELETION_RECEIPT_SALT is required when deletion receipts are enabled")
+
     return AppConfig(
         app_env=app_env,
         cors_origins=cors_origins,
@@ -100,6 +147,7 @@ def load_config() -> AppConfig:
         ratelimit_register=_str_env("RATELIMIT_REGISTER") or "30 per minute",
         ratelimit_upload_session=_str_env("RATELIMIT_UPLOAD_SESSION") or "60 per minute",
         ratelimit_upload_chunk=_str_env("RATELIMIT_UPLOAD_CHUNK") or "240 per minute",
+        ratelimit_verify=_str_env("RATELIMIT_VERIFY") or "30 per minute",
         release_id=_release_id(os.getenv("HARPOCRATES_RELEASE_ID", "harpocrates-1.0.0")),
         release_network=_release_network(os.getenv("HARPOCRATES_RELEASE_NETWORK", "testnet")),
         metrics_enabled=_bool_env("METRICS_ENABLED", True),
@@ -125,12 +173,33 @@ def load_config() -> AppConfig:
         verifier_cache_max_size=_int_env("VERIFIER_CACHE_MAX_SIZE", 10000),
         verifier_cache_positive_ttl_seconds=_float_env("VERIFIER_CACHE_POSITIVE_TTL_SECONDS", 86400.0),
         verifier_cache_negative_ttl_seconds=_float_env("VERIFIER_CACHE_NEGATIVE_TTL_SECONDS", 300.0),
+        stego_memory_limit_bytes=_int_env("STEGO_MEMORY_LIMIT_BYTES", 536_870_912),
+        stego_cpu_limit_seconds=_int_env("STEGO_CPU_LIMIT_SECONDS", 60),
+        stego_pool_max_workers=_int_env("STEGO_POOL_MAX_WORKERS", 4),
         external_fetch_connect_timeout_seconds=_float_env("EXTERNAL_FETCH_CONNECT_TIMEOUT_SECONDS", 5.0),
         external_fetch_read_timeout_seconds=_float_env("EXTERNAL_FETCH_READ_TIMEOUT_SECONDS", 10.0),
         external_fetch_max_response_bytes=_int_env("EXTERNAL_FETCH_MAX_RESPONSE_BYTES", 65_536),
         register_scoped_keys=parse_scoped_keys(_str_env("REGISTER_SCOPED_KEYS")),
+        job_file_ttl_seconds=_job_file_ttl_env(),
+        job_queue_ttl_seconds=_job_file_ttl_env(
+            "HARPOCRATES_JOB_QUEUE_TTL_SECONDS", JOB_QUEUE_TTL_SECONDS_DEFAULT
+        ),
+        job_execution_timeout_seconds=_job_file_ttl_env(
+            "HARPOCRATES_JOB_EXECUTION_TIMEOUT_SECONDS", JOB_EXECUTION_TIMEOUT_SECONDS_DEFAULT
+        ),
+        retention_blob_gc_enabled=_blob_gc_enabled_env(),
+        retention_unreferenced_blobs_enabled=_blob_gc_enabled_env(),
+        retention_dry_run=_bool_env("HARPOCRATES_RETENTION_DRY_RUN", False),
+        deletion_receipts_enabled=deletion_receipts_enabled,
+        deletion_receipt_salt=deletion_receipt_salt,
+        deletion_receipt_ttl_seconds=_int_env("DELETION_RECEIPT_TTL_SECONDS", 2_592_000),
+        registration_reconcile_state_dir=_str_env("HARPOCRATES_REGISTRATION_RECONCILE_DIR") or "",
+        stellar_network_passphrase=(
+            _str_env("STELLAR_NETWORK_PASSPHRASE")
+            or _str_env("HARPOCRATES_NETWORK_PASSPHRASE")
+            or ""
+        ),
     )
-
 
 
 def _upload_chunk_bytes() -> int:
@@ -149,6 +218,19 @@ def _upload_chunk_bytes() -> int:
 def _csv(name: str, default: str) -> list[str]:
     value = os.getenv(name, default)
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _optional_nonnegative_int_env(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a non-negative integer") from exc
+    if parsed < 0:
+        raise RuntimeError(f"{name} must be a non-negative integer")
+    return parsed
 
 
 def _int_env(name: str, default: int) -> int:
@@ -205,19 +287,10 @@ def _datetime_env(name: str) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as exc:
+        raise RuntimeError(f"{name} must be an ISO-8601 datetime") from except ValueError as exc:
         raise RuntimeError(f"{name} must be an ISO-8601 timestamp") from exc
     if parsed.tzinfo is None:
-        raise RuntimeError(f"{name} must include a timezone")
-    return parsed.astimezone(timezone.utc)
-
-
-def _float_env(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    parsed = float(value)
-    if parsed <= 0.0:
-        raise RuntimeError(f"{name} must be positive")
+        parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
 
 
@@ -250,3 +323,46 @@ def _retention_batch_size_env(name: str = "HARPOCRATES_RETENTION_BATCH_SIZE", de
     except ValueError as exc:
         raise RuntimeError(f"{name} must be an integer") from exc
     return max(1, min(parsed, RETENTION_BATCH_SIZE_MAX))
+
+
+JOB_FILE_TTL_SECONDS_DEFAULT = 86_400
+# Queue expiry (time a job may wait as ``pending``) and execution timeout (time a
+# leased job may run) are separate limits. 0 disables a limit.
+JOB_QUEUE_TTL_SECONDS_DEFAULT = 0
+JOB_EXECUTION_TIMEOUT_SECONDS_DEFAULT = 0
+
+
+def _job_file_ttl_env(
+    name: str = "HARPOCRATES_JOB_FILE_TTL_SECONDS",
+    default: int = JOB_FILE_TTL_SECONDS_DEFAULT,
+) -> int:
+    """Load a non-negative integer seconds setting.
+
+    Defaults to HARPOCRATES_JOB_FILE_TTL_SECONDS (24h = 86400s); also used for
+    HARPOCRATES_JOB_QUEUE_TTL_SECONDS and HARPOCRATES_JOB_EXECUTION_TIMEOUT_SECONDS.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if parsed < 0:
+        raise RuntimeError(f"{name} must be non-negative")
+    return parsed
+
+
+def _blob_gc_enabled_env() -> bool:
+    """Return whether blob garbage collection is enabled in retention worker."""
+    for var in (
+        "RETENTION_BLOB_GC_ENABLED",
+        "HARPOCRATES_RETENTION_BLOB_GC_ENABLED",
+        "RETENTION_UNREFERENCED_BLOBS_ENABLED",
+        "HARPOCRATES_RETENTION_UNREFERENCED_BLOBS_ENABLED",
+    ):
+        val = os.getenv(var)
+        if val is not None:
+            return val.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+

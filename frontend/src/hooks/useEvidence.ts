@@ -1,16 +1,15 @@
-/**
- * useEvidence — manages the full evidence creation flow:
- * hashing → embedding → (optional) Noir proving → Stellar registration.
+/*
+ * useEvidence — manages the full evidence creation flow: hashing → embedding → (optional) Noir proving → Stellar registration.
  *
  * Source-file hashing runs chunk-by-chunk inside a dedicated Web Worker with
  * byte-level progress, keeping the UI responsive for large videos.
  *
- * Silent Witness proving runs in a cancellable Web Worker so the UI stays
- * responsive and in-flight proofs can be aborted without leaking witness
- * material (see docs/proof-worker.md).
+ * Silent Witness proving runs in a cancellable Web Worker so the UI keeps responsive
+ * and in-flight proofs can be aborted without leaking witness material (see
+ * docs/proof-worker.md).
  */
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Building2, Fingerprint, KeyRound } from 'lucide-react'
 import type { IdentityTier, ProofPackage, SilentWitnessProof, Stage } from '../types'
 import type { RegisterProofResult } from '../stellarTypes'
@@ -20,6 +19,13 @@ import {
   ProofWorkerError,
 } from '../workers/proofWorkerClient'
 import { hashFileInWorker } from '../workers/fileHashWorkerClient'
+import { appConfig } from '../config'
+import { CIRCUIT_INPUT_SCHEMA_VERSION, silentWitnessEpoch } from '../circuitInputSchema'
+import {
+  buildProofPreparationPreview,
+  PROOF_PREPARATION_VERIFIER_SCOPE,
+  type ProofPreparationPreviewResult,
+} from '../proofPreparationPreview'
 
 export const TIERS = [
   {
@@ -43,12 +49,14 @@ export const TIERS = [
     icon: Building2,
     description:
       'Verified issuer account signs the evidence as an official source. The connected wallet must be registered by the admin first.',
-  },
-]
+  },]
 
-const CONTRACT_ID = import.meta.env.VITE_HARPOCRATES_REGISTRY_ID ?? ''
+const CONTRACT_ID = appConfig.harpocratesRegistryId
 
 // Privacy-safe stable copy — never includes file names, hashes, or secrets.
+export const EVIDENCE_REPLACED_MESSAGE =
+  'Evidence file replaced. Previous proof, registration, and verification state were cleared; verify or register the newly selected file.'
+
 const CANCELLED_MESSAGES: Record<Stage, string> = {
   idle: 'Request cancelled.',
   hashing: 'Upload cancelled.',
@@ -58,6 +66,27 @@ const CANCELLED_MESSAGES: Record<Stage, string> = {
   registered: 'Request cancelled.',
   error: 'Request cancelled.',
   cancelled: 'Request cancelled.',
+}
+
+export type NetworkMismatchRecoveryState = {
+  /** Human-readable name of the network required by the deployed contract (e.g. "Testnet"). */
+  requiredNetwork: string
+  /** Human-readable name of the wallet's currently reported network (e.g. "Mainnet"), or "Unavailable". */
+  currentWalletNetwork: string
+  /** Non-identifying explanation of the mismatch. */
+  reason: string
+  /** Actionable remediation guidance for switching networks. */
+  remediation: string
+  /** True while a fresh network and evidence-intent validation is in progress. */
+  isValidating: boolean
+  /** Snapshot of the evidence intent active when the mismatch was detected. */
+  intent: {
+    proofId: string
+    tier: IdentityTier
+    videoHash: string
+  } | null
+  /** Optional privacy-safe error message from the most recent re-validation attempt. */
+  validationError: string | null
 }
 
 export type UseEvidenceReturn = {
@@ -75,11 +104,21 @@ export type UseEvidenceReturn = {
   nullifierSeed: string
   setNullifierSeed: (v: string) => void
   message: string
+  /** Read-only preview of the canonical proof inputs and policy version. */
+  proofPreparation: ProofPreparationPreviewResult
+  /** Sensitive export field keys explicitly acknowledged by the operator in this session. */
+  acknowledgedSensitiveFields: string[]
+  /** Record explicit operator acknowledgement for newly exposed sensitive export fields. */
+  acknowledgeSensitiveFields: (keys: string[]) => void
   registration: RegisterProofResult | null
   networkMismatch: string | null
+  /** Guided recovery state when the wallet network does not match the required contract network. */
+  networkMismatchRecovery: NetworkMismatchRecoveryState | null
   isCancellable: boolean
   handleEvidence: (nextFile: File | null) => Promise<void>
   registerProof: (wallet: string) => Promise<void>
+  /** Re-validate the wallet network and selected evidence intent before allowing registration to resume. */
+  revalidateNetworkMismatch: (wallet: string) => Promise<boolean>
   cancelEvidence: () => void
   /** Cancel an in-flight Silent Witness proof generation (no-op if idle). */
   cancelProving: () => void
@@ -98,41 +137,62 @@ export function useEvidence(): UseEvidenceReturn {
   const [hashProgress, setHashProgress] = useState<HashProgress | null>(null)
   const [file, setFile] = useState<File | null>(null)
   const [proof, setProof] = useState<ProofPackage | null>(null)
-  const [processedVideoUrl, setProcessedVideoUrl] = useState('')
-  const [credentialSeed, setCredentialSeed] = useState('')
-  const [nullifierSeed, setNullifierSeed] = useState('')
-  const [message, setMessage] = useState('Upload evidence to begin.')
+  const [processedVideoUrl, setProcessedVideoUrl] = useState<string>('')
+  const [credentialSeed, setCredentialSeed] = useState<string>('')
+  const [nullifierSeed, setNullifierSeed] = useState<string>('')
+  const [message, setMessage] = useState<string>('Upload evidence to begin.')
+  const [evidenceChangeNotice, setEvidenceChangeNotice] = useState<string | null>(null)
   const [registration, setRegistration] = useState<RegisterProofResult | null>(null)
   const [networkMismatch, setNetworkMismatch] = useState<string | null>(null)
+  const [networkMismatchRecovery, setNetworkMismatchRecovery] =
+    useState<NetworkMismatchRecoveryState | null>(null)
+  const [acknowledgedSensitiveFields, setAcknowledgedSensitiveFields] = useState<string[]>([])
   // Keep retries safe: a completed proof/wallet pair must never be submitted twice.
-  const registrationInFlightRef = useRef(false)
+  const registrationInFlightedRef = useRef<boolean>(false)
   const completedRegistrationRef = useRef<string | null>(null)
   const pendingPersistenceRef = useRef<PendingRegistration | null>(null)
+  const processedVideoUrlRef = useRef<string>('')
+  const hasSelectedEvidenceRef = useRef<boolean>(false)
 
-  // Sequence guard + abort plumbing so stale uploads/proofs cannot clobber
-  // a newer flow or a reset caused by cancellation.
-  const seqRef = useRef(0)
+  // Sequence guard + abort plumbing so stale uploads/proofs cannot clobber a
+  // newer flow or a reset caused by cancellation.
+  const seqRef = useRef<number>(0)
   const abortRef = useRef<AbortController | null>(null)
   const proofClientRef = useRef<ProofWorkerClient | null>(null)
   const proofRequestIdRef = useRef<string | null>(null)
   const stageRef = useRef<Stage>('idle')
+  const proofRef = useRef<ProofPackage | null>(null)
+  const selectedTierRef = useRef<IdentityTier>('silent')
   const proveAbortRef = useRef<AbortController | null>(null)
   const evidenceFlowAbortRef = useRef<AbortController | null>(null)
+  const cachedFileHashRef = useRef<{
+    file: File
+    name: string
+    size: number
+    lastModified: number
+    digest: string
+  } | null>(null)
 
   useEffect(() => {
     stageRef.current = stage
   }, [stage])
 
   useEffect(() => {
-    const abortController = abortRef.current
-    const provingAbortController = proveAbortRef.current
+    proofRef.current = proof
+  }, [proof])
+
+  useEffect(() => {
+    selectedTierRef.current = selectedTier
+  }, [selectedTier])
+
+  useEffect(() => {
     return () => {
       // Cancel any in-flight evidence flow (hashing → embedding) on unmount.
       evidenceFlowAbortRef.current?.abort()
       evidenceFlowAbortRef.current = null
       proveAbortRef.current?.abort()
       proveAbortRef.current = null
-      activeRequestIdRef.current = null
+      proofRequestIdRef.current = null
       proofClientRef.current?.destroy()
       proofClientRef.current = null
     }
@@ -143,7 +203,32 @@ export function useEvidence(): UseEvidenceReturn {
     [selectedTier],
   )
 
+  // Read-only: derived from the evidence package and the proving policy alone.
+  // It never touches seeds, loads a circuit, or submits anything.
+  const proofPreparation = useMemo(
+    () =>
+      buildProofPreparationPreview({
+        proof,
+        tier: selectedTier,
+        verifierScope: PROOF_PREPARATION_VERIFIER_SCOPE,
+        epoch: silentWitnessEpoch(),
+      }),
+    [proof, selectedTier],
+  )
+
   const isCancellable = stage === 'hashing' || stage === 'embedding' || stage === 'proving'
+
+  function clearProcessedVideoUrl() {
+    if (processedVideoUrlRef.current) {
+      URL.revokeObjectURL(processedVideoUrlRef.current)
+      processedVideoUrlRef.current = ''
+    }
+    setProcessedVideoUrl('')
+  }
+
+  function clearEvidenceChangeNotice() {
+    setEvidenceChangeNotice(null)
+  }
 
   function resetFlow() {
     abortRef.current?.abort()
@@ -155,11 +240,28 @@ export function useEvidence(): UseEvidenceReturn {
     proofRequestIdRef.current = null
     proofClientRef.current?.destroy()
     proofClientRef.current = null
-    if (processedVideoUrl) URL.revokeObjectURL(processedVideoUrl)
-    setProcessedVideoUrl('')
+    pendingPersistenceRef.current = null
+    hasSelectedEvidenceRef.current = false
+    clearProcessedVideoUrl()
     setProof(null)
     setFile(null)
     setRegistration(null)
+    setNetworkMismatch(null)
+    setNetworkMismatchRecovery(null)
+    setAcknowledgedSensitiveFields([])
+  }
+
+  function acknowledgeSensitiveFields(keys: string[]) {
+    if (!keys.length) return
+    setAcknowledgedSensitiveFields((prev) => {
+      const merged = new Set(prev)
+      for (const key of keys) {
+        if (typeof key === 'string' && key.length > 0) {
+          merged.add(key)
+        }
+      }
+      return Array.from(merged)
+    })
   }
 
   function getProofClient(): ProofWorkerClient {
@@ -181,34 +283,79 @@ export function useEvidence(): UseEvidenceReturn {
   async function handleEvidence(nextFile: File | null) {
     if (!nextFile) return
 
+    const hadPriorEvidence =
+      hasSelectedEvidenceRef.current ||
+      Boolean(file || proof || registration || processedVideoUrlRef.current)
+
     evidenceFlowAbortRef.current?.abort()
     const controller = new AbortController()
     evidenceFlowAbortRef.current = controller
     const isCurrentFlow = () =>
       evidenceFlowAbortRef.current === controller && !controller.signal.aborted
 
+    // Clear stale proof, download URL, and registration state before processing
+    // the replacement file so previous evidence state can never leak onto it.
+    cancelProving()
+    seqRef.current += 1
+    pendingPersistenceRef.current = null
+    clearProcessedVideoUrl()
+    setProof(null)
+    setRegistration(null)
+    hasSelectedEvidenceRef.current = true
+    setEvidenceChangeNotice(hadPriorEvidence ? EVIDENCE_REPLACED_MESSAGE : null)
     setFile(nextFile)
-    setHashProgress({
-      processedBytes: 0,
-      totalBytes: nextFile.size,
-      percentage: nextFile.size === 0 ? 100 : 0,
-    })
-    setStage('hashing')
-    setMessage('Hashing video locally in the browser: 0%.')
+
+    const cached = cachedFileHashRef.current
+    const isCacheHit =
+      cached !== null &&
+      cached.file === nextFile &&
+      cached.name === nextFile.name &&
+      cached.size === nextFile.size &&
+      cached.lastModified === nextFile.lastModified
+
+    if (!isCacheHit) {
+      cachedFileHashRef.current = null
+      setHashProgress({
+        processedBytes: 0,
+        totalBytes: nextFile.size,
+        percentage: nextFile.size === 0 ? 100 : 0,
+      })
+      setStage('hashing')
+      setMessage('Hashing video locally in the browser: 0%.')
+    } else {
+      setHashProgress({
+        processedBytes: nextFile.size,
+        totalBytes: nextFile.size,
+        percentage: 100,
+      })
+    }
 
     try {
-      const sourceHash = await hashFileInWorker(
-        nextFile,
-        (progress) => {
-          if (!isCurrentFlow()) return
-          setHashProgress(progress)
-          setMessage(
-            `Hashing video locally in the browser: ${progress.percentage}% (${progress.processedBytes.toLocaleString()} / ${progress.totalBytes.toLocaleString()} bytes).`,
-          )
-        },
-        controller.signal,
-      )
-      if (!isCurrentFlow()) return
+      let sourceHash: string
+      if (isCacheHit) {
+        sourceHash = cached.digest
+      } else {
+        sourceHash = await hashFileInWorker(
+          nextFile,
+          (progress) => {
+            if (!isCurrentFlow()) return
+            setHashProgress(progress)
+            if (progress.percentage !== lastAnnouncedPercentageRef.current) {
+              setMessage(`Hashing video locally in the browser: ${progress.percentage}% (${progress.processedBytes.toLocaleString()} / ${progress.totalBytes.toLocaleString()} bytes).`);
+              lastAnnouncedPercentageRef.current = progress.percentage;
+            }
+          },
+          controller.signal,
+        )
+        if (!isCurrentFlow()) return
+        cachedFileHashRef.current = {
+          file: nextFile,
+          name: nextFile.name,
+          size: nextFile.size,
+          lastModified: nextFile.lastModified,
+          digest: sourceHash,
+        }
+      }
 
       const { sha256 } = await import('../utils')
       const proofId = await sha256(`${sourceHash}:${crypto.randomUUID()}`)
@@ -226,14 +373,16 @@ export function useEvidence(): UseEvidenceReturn {
         sourceHash,
         proofId,
         timestamp,
-        signal,
+        controller.signal,
       )
       if (!isCurrentFlow()) return
 
-      if (processedVideoUrl) URL.revokeObjectURL(processedVideoUrl)
-      setProcessedVideoUrl(URL.createObjectURL(embeddedBlob))
+      clearProcessedVideoUrl()
+      const nextUrl = URL.createObjectURL(embeddedBlob)
+      processedVideoUrlRef.current = nextUrl
+      setProcessedVideoUrl(nextUrl)
       setProof({
-        fileName: `harpocrates-${nextFile.name.replace(/\.[^.]+$/, '')}.mp4`,
+        fileName: `harpocrates-${nextFile.name.replace(/[^.]+$/, '')}.mp4`,
         sourceHash,
         videoHash: embeddedHash,
         metadataHash,
@@ -269,16 +418,52 @@ export function useEvidence(): UseEvidenceReturn {
 
     try {
       const { getWalletNetwork, CONTRACT_NETWORK_PASSPHRASE } = await import('../stellar')
-      const { checkNetworkMatch } = await import('../networkGuard')
+      const { checkNetworkMatch, networkName } = await import('../networkGuard')
       const walletPassphrase = await getWalletNetwork()
       const check = checkNetworkMatch(walletPassphrase, CONTRACT_NETWORK_PASSPHRASE)
       if (!check.ok) {
+        const requiredNetwork = networkName(CONTRACT_NETWORK_PASSPHRASE)
+        const trimmedWallet = (walletPassphrase ?? '').trim()
+        const currentWalletNetwork = trimmedWallet ? networkName(trimmedWallet) : 'Unavailable'
         setNetworkMismatch(`${check.reason} ${check.remediation}`)
+        setNetworkMismatchRecovery({
+          requiredNetwork,
+          currentWalletNetwork,
+          reason: check.reason,
+          remediation: check.remediation,
+          isValidating: false,
+          intent: {
+            proofId: proof.proofId,
+            tier: selectedTier,
+            videoHash: proof.videoHash,
+          },
+          validationError: null,
+        })
         setMessage(check.reason)
         return
       }
       setNetworkMismatch(null)
+      setNetworkMismatchRecovery(null)
     } catch {
+      const { CONTRACT_NETWORK_PASSPHRASE } = await import('../stellar')
+      const { networkName } = await import('../networkGuard')
+      const requiredNetwork = networkName(CONTRACT_NETWORK_PASSPHRASE)
+      const reason = 'Could not verify wallet network before submitting.'
+      const remediation = `Reconnect Freighter on ${requiredNetwork}, then re-validate to resume.`
+      setNetworkMismatch(`${reason} ${remediation}`)
+      setNetworkMismatchRecovery({
+        requiredNetwork,
+        currentWalletNetwork: 'Unavailable',
+        reason,
+        remediation,
+        isValidating: false,
+        intent: {
+          proofId: proof.proofId,
+          tier: selectedTier,
+          videoHash: proof.videoHash,
+        },
+        validationError: null,
+      })
       setMessage('Could not verify wallet network before submitting. Reconnect Freighter and try again.')
       return
     }
@@ -294,11 +479,11 @@ export function useEvidence(): UseEvidenceReturn {
         setMessage('A completed registration still needs to be saved. Please retry it first.')
         return
       }
-      if (registrationInFlightRef.current) {
+      if (registrationInFlightedRef.current) {
         setMessage('Registration is already in progress. Please wait for its result.')
         return
       }
-      registrationInFlightRef.current = true
+      registrationInFlightedRef.current = true
       setMessage('Saving the completed Stellar registration.')
       try {
         const { persistRegistration } = await import('../services/evidenceService')
@@ -306,152 +491,238 @@ export function useEvidence(): UseEvidenceReturn {
         pendingPersistenceRef.current = null
         completedRegistrationRef.current = registrationKey
         setRegistration(pendingPersistence.result)
+        setEvidenceChangeNotice(null)
         setStage('registered')
         setMessage(`Registration submitted with Stellar status: ${pendingPersistence.result.status}.`)
       } catch (error) {
         setStage('error')
         setMessage(error instanceof Error ? error.message : 'Could not save the Stellar registration.')
       } finally {
-        registrationInFlightRef.current = false
+        registrationInFlightedRef.current = false
       }
       return
     }
-    if (registrationInFlightRef.current) {
+    if (registrationInFlightedRef.current) {
       setMessage('Registration is already in progress. Please wait for its result.')
       return
     }
-    registrationInFlightRef.current = true
+    registrationInFlightedRef.current = true
 
     setMessage(`Submitting ${selectedTierMeta.title} proof to Stellar Testnet.`)
 
     try {
       const proofForRegistration =
         selectedTier === 'silent' && !proof.silentWitness
-          ? await attachSilentWitnessProof(proof, seq, abortRef.current?.signal)
+          ? await attachSilentWitnessProof(proof, seqRef.current, abortRef.current?.signal)
           : proof
-      if (seq !== seqRef.current) return
+      if (seqRef.current !== seqRef.current) return
 
       const { registerProofOnStellar } = await import('../stellar')
       const result = await registerProofOnStellar({
         contractId: CONTRACT_ID,
         publicKey: wallet,
-        tier: selectedTier,
-        videoHash: proofForRegistration.videoHash,
-        metadataHash: proofForRegistration.metadataHash,
-        proofId: proofForRegistration.proofId,
-        silentWitness: proofForRegistration.silentWitness
-          ? {
-              publicInputs: proofForRegistration.silentWitness.publicInputs,
-              proof: proofForRegistration.silentWitness.proof,
-            }
-          : undefined,
+        proof: proofForRegistration,
       })
-
-      // Preserve the confirmed chain result before persistence. A retry after
-      // a database failure must save this result, never submit the proof again.
       pendingPersistenceRef.current = {
         key: registrationKey,
         proof: proofForRegistration,
         result,
         wallet,
       }
-      setRegistration(result)
-
       const { persistRegistration } = await import('../services/evidenceService')
       await persistRegistration(proofForRegistration, result, wallet)
-
       pendingPersistenceRef.current = null
-      setStage('registered')
       completedRegistrationRef.current = registrationKey
+      setRegistration(result)
+      setEvidenceChangeNotice(null)
+      setStage('registered')
       setMessage(`Registration submitted with Stellar status: ${result.status}.`)
     } catch (error) {
-      if (seq !== seqRef.current) return
-      if (isCancellationError(error) || abortRef.current?.signal.aborted) {
-        setStage('cancelled')
-        setMessage(CANCELLED_MESSAGES.proving)
-        return
-      }
-      if (error instanceof ProofWorkerError && error.code === 'CANCELLED') {
-        setStage('ready')
-        setMessage('Proof generation cancelled. Witness buffers were discarded; you can register again when ready.')
-        return
-      }
       setStage('error')
-      const safeMessage =
-        error instanceof ProofWorkerError
-          ? error.message
-          : error instanceof Error
-            ? error.message
-            : 'Stellar registration failed.'
-      setMessage(safeMessage)
+      setMessage(error instanceof Error ? error.message : 'Stellar registration failed.')
     } finally {
-      registrationInFlightRef.current = false
+      registrationInFlightedRef.current = false
+    }
+  }
+
+  async function revalidateNetworkMismatch(wallet: string): Promise<boolean> {
+    const activeProof = proofRef.current ?? proof
+    const activeTier = selectedTierRef.current
+    const seq = seqRef.current
+
+    if (!wallet) {
+      const validationError = 'Connect Freighter on the required network before resuming.'
+      setNetworkMismatchRecovery((prev) =>
+        prev ? { ...prev, isValidating: false, validationError } : prev,
+      )
+      setMessage(validationError)
+      return false
+    }
+
+    if (!activeProof) {
+      const validationError = 'Select and prepare an evidence file before resuming.'
+      setNetworkMismatchRecovery((prev) =>
+        prev ? { ...prev, isValidating: false, validationError } : prev,
+      )
+      setMessage(validationError)
+      return false
+    }
+
+    if (activeProof.tier !== activeTier) {
+      const validationError =
+        'Selected identity tier changed since evidence preparation. Re-upload or switch back to the prepared tier before resuming.'
+      setNetworkMismatchRecovery((prev) =>
+        prev ? { ...prev, isValidating: false, validationError } : prev,
+      )
+      setMessage(validationError)
+      return false
+    }
+
+    if (!CONTRACT_ID) {
+      const validationError = 'Set VITE_HARPOCRATES_REGISTRY_ID after deploying the Soroban contract.'
+      setNetworkMismatchRecovery((prev) =>
+        prev ? { ...prev, isValidating: false, validationError } : prev,
+      )
+      setMessage(validationError)
+      return false
+    }
+
+    setNetworkMismatchRecovery((prev) =>
+      prev ? { ...prev, isValidating: true, validationError: null } : prev,
+    )
+
+    try {
+      const { getWalletNetwork, CONTRACT_NETWORK_PASSPHRASE } = await import('../stellar')
+      const { checkNetworkMatch, networkName } = await import('../networkGuard')
+      const walletPassphrase = await getWalletNetwork()
+
+      // Fail closed if the selected evidence intent changed while validation was in flight.
+      const latestProof = proofRef.current
+      if (
+        seqRef.current !== seq ||
+        !latestProof ||
+        latestProof.proofId !== activeProof.proofId ||
+        latestProof.videoHash !== activeProof.videoHash ||
+        selectedTierRef.current !== activeTier
+      ) {
+        const validationError =
+          'Selected evidence intent changed during network validation. Re-validate before resuming.'
+        setNetworkMismatchRecovery((prev) =>
+          prev ? { ...prev, isValidating: false, validationError } : prev,
+        )
+        setMessage(validationError)
+        return false
+      }
+
+      const requiredNetwork = networkName(CONTRACT_NETWORK_PASSPHRASE)
+      const trimmedWallet = (walletPassphrase ?? '').trim()
+      const currentWalletNetwork = trimmedWallet ? networkName(trimmedWallet) : 'Unavailable'
+      const check = checkNetworkMatch(walletPassphrase, CONTRACT_NETWORK_PASSPHRASE)
+
+      if (!check.ok) {
+        setNetworkMismatch(`${check.reason} ${check.remediation}`)
+        setNetworkMismatchRecovery({
+          requiredNetwork,
+          currentWalletNetwork,
+          reason: check.reason,
+          remediation: check.remediation,
+          isValidating: false,
+          intent: {
+            proofId: activeProof.proofId,
+            tier: activeTier,
+            videoHash: activeProof.videoHash,
+          },
+          validationError: check.reason,
+        })
+        setMessage(check.reason)
+        return false
+      }
+
+      setNetworkMismatch(null)
+      setNetworkMismatchRecovery(null)
+      setMessage(`Network validated on ${requiredNetwork}. Ready to resume registration.`)
+      return true
+    } catch {
+      const validationError =
+        'Could not verify wallet network. Unlock or reconnect Freighter and re-validate.'
+      setNetworkMismatchRecovery((prev) =>
+        prev
+          ? {
+              ...prev,
+              currentWalletNetwork: 'Unavailable',
+              isValidating: false,
+              validationError,
+            }
+          : prev,
+      )
+      setMessage(validationError)
+      return false
     }
   }
 
   async function attachSilentWitnessProof(
-    nextProof: ProofPackage,
+    baseProof: ProofPackage,
     seq: number,
     signal?: AbortSignal,
   ): Promise<ProofPackage> {
-    if (!credentialSeed.trim() || !nullifierSeed.trim()) {
-      throw new Error('Silent Witness requires your credential and nullifier seeds.')
+    const client = getProofClient()
+    const requestId = crypto.randomUUID()
+    proofRequestIdRef.current = requestId
+    const controller = new AbortController()
+    proveAbortRef.current = controller
+    if (signal) {
+      if (signal.aborted) controller.abort()
+      else signal.addEventListener('abort', () => controller.abort())
     }
 
     setStage('proving')
-    setProofStage(null)
-    setMessage('Generating Noir UltraHonk proof in this browser.')
+    setMessage('Generating Silent Witness ZK proof locally.')
 
-    const { fieldSecret } = await import('../utils')
-    throwIfAborted(signal)
-    const [credentialSecret, nullifierSecret] = await Promise.all([
-      fieldSecret('credential', credentialSeed.trim()),
-      fieldSecret('nullifier', nullifierSeed.trim()),
-    ])
-    throwIfAborted(signal)
-
-    const silentWitness = await runProver(nextProof, credentialSecret, nullifierSecret)
-    if (seq !== seqRef.current) return nextProof
-    throwIfAborted(signal)
-
-    const nextWithProof: ProofPackage = { ...nextProof, silentWitness }
-    setProof(nextWithProof)
-    return nextWithProof
-  }
-
-  async function runProver(
-    nextProof: ProofPackage,
-    credentialSecret: string,
-    nullifierSecret: string,
-  ): Promise<SilentWitnessProof> {
-    const client = getProofClient()
-    const { requestId, result } = client.generate({
-      videoHash: nextProof.videoHash,
-      credentialSecret,
-      nullifierSecret,
-    })
-    proofRequestIdRef.current = requestId
     try {
-      const silentWitness = await result
-      proofRequestIdRef.current = null
-      return silentWitness
+      const silentWitness: SilentWitnessProof = await client.generateProof({
+        requestId,
+        videoHash: baseProof.videoHash,
+        credentialSecret: credentialSeed,
+        nullifierSecret: nullifierSeed,
+        inputSchemaVersion: CIRCUIT_INPUT_SCHEMA_VERSION,
+        verifierScope: PROOF_PREPARATION_VERIFIER_SCOPE,
+        epoch: silentWitnessEpoch(),
+        signal: controller.signal,
+        onProgress: () => {
+          if (seqRef.current !== seq) return
+        },
+      })
+      if (seqRef.current !== seq) throw new Error('Stale proof result ignored.')
+      return { ...baseProof, silentWitness }
     } catch (error) {
-      proofRequestIdRef.current = null
       if (error instanceof ProofWorkerError && error.code === 'CANCELLED') {
-        throw new FlowCancelledError('Proof generation cancelled.')
+        throw new Error('Proof generation cancelled.', { cause: error })
       }
       throw error
+    } finally {
+      if (proofRequestIdRef.current === requestId) {
+        proofRequestIdRef.current = null
+      }
+      if (proveAbortRef.current === controller) {
+        proveAbortRef.current = null
+      }
     }
   }
 
   function cancelEvidence() {
-    if (!isCancellable) return
-
-    const sourceStage = stageRef.current
-    proveAbortRef.current?.abort()
+    const currentStage = stageRef.current
+    if (currentStage !== 'hashing' && currentStage !== 'embedding' && currentStage !== 'proving') {
+      return
+    }
+    evidenceFlowAbortRef.current?.abort()
+    evidenceFlowAbortRef.current = null
+    if (currentStage === 'proving') {
+      cancelProving()
+    }
     resetFlow()
+    setHashProgress(null)
     setStage('cancelled')
-    setMessage(CANCELLED_MESSAGES[sourceStage])
+    setMessage(CANCELLED_MESSAGES[currentStage])
   }
 
   return {
@@ -468,11 +739,16 @@ export function useEvidence(): UseEvidenceReturn {
     nullifierSeed,
     setNullifierSeed,
     message,
+    proofPreparation,
+    acknowledgedSensitiveFields,
+    acknowledgeSensitiveFields,
     registration,
     networkMismatch,
+    networkMismatchRecovery,
     isCancellable,
     handleEvidence,
     registerProof,
+    revalidateNetworkMismatch,
     cancelEvidence,
     cancelProving,
   }

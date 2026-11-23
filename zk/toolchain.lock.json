@@ -178,6 +178,18 @@
       "kind": "json",
       "role": "published_acir",
       "required": false
+    },
+    {
+      "path": "frontend/public/noir/redacted_ancestry.json",
+      "kind": "json",
+      "role": "published_acir",
+      "required": false
+    },
+    {
+      "path": "frontend/public/noir/redacted_ancestry_helper.json",
+      "kind": "json",
+      "role": "published_acir",
+      "required": false
     }
   ],
 
@@ -186,6 +198,8 @@
     "globs": [
       "zk/noir/*/src/*.nr",
       "zk/noir/*/Nargo.toml",
+      "zk/noir/fixtures/scoped_nullifier_statement_descriptor_v1.json",
+      "zk/tools/scoped_nullifier_descriptor.py",
       "zk/toolchain.lock.json"
     ]
   },

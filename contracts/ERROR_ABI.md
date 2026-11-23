@@ -44,8 +44,9 @@ scope are `malformed`, `oversized`, `expired`, `revoked`, `unsupported`, and
 
 `Retryable` means the *same* call may succeed later with no code or input change,
 once the external condition (unpause, timelock delay, activation ledger, cooldown,
-issuer rotation grace window) has resolved. Every other code requires a different
-input, a different actor, or new evidence before the call can succeed.
+issuer rotation grace window, quota window rollover) has resolved. Every other
+code requires a different input, a different actor, or new evidence before the
+call can succeed.
 
 | Code | Variant | Class | Retryable | Meaning |
 |------|---------|-------|-----------|---------|
@@ -101,7 +102,7 @@ input, a different actor, or new evidence before the call can succeed.
 | 50 | `UnknownSchema` | unsupported | no | The schema id is not registered. |
 | 51 | `InactiveSchema` | unsupported | no | The schema was deprecated and cannot be used. |
 | 52 | `SchemaVersionMismatch` | unsupported | no | The schema version is not the expected one. |
-| 53 | `StaleEpoch` | expired | no | The scoped-nullifier proof was generated for a stale scope epoch. |
+| 53 | `StaleEpoch` | expired | no | The scoped-nullifier proof was generated for a stale scope epoch, or `set_scope_epoch` attempted a non-increasing epoch. |
 | 54 | `BatchSizeExceeded` | oversized | no | The batch is empty or above the element cap. |
 | 55 | `BatchCredentialRootMismatch` | malformed | no | Batch elements do not share one credential root. |
 | 56 | `BatchCountMismatch` | malformed | no | The batch size does not match the supplied video-hash list. |
@@ -136,6 +137,16 @@ input, a different actor, or new evidence before the call can succeed.
 | 85 | `IssuerRotationNotFound` | state | no | No issuer rotation grace record exists for the requested key. |
 | 86 | `IssuerRotationGraceStillActive` | state | yes | The issuer rotation grace window has not lapsed; retry once it has. |
 | 87 | `CircuitVersionMismatch` | unsupported | no | The scoped envelope commits a circuit version other than the expected one, or is the bare frame that commits none. |
+| 88 | `ReporterDisputesSaturated` | resource | no | The reporter reached `MAX_OPEN_DISPUTES_PER_REPORTER`. |
+| 89 | `InsufficientApprovals` | auth | no | The action requires admin council threshold approvals. |
+| 90 | `InvalidCursor` | malformed | no | The verifier-list cursor is outside the supported range. |
+| 91 | `ListLimitExceeded` | oversized | no | The verifier-list page limit exceeds `MAX_VERIFIER_LIST_LIMIT`. |
+| 92 | `ExpiredCredentialRoot` | expired | no | The credential root has expired and cannot be used. |
+| 93 | `RoleConflict` | conflict | no | The configured roles conflict with the requested operation. |
+| 94 | `InvalidInclusionProof` | malformed | no | The source-batch inclusion proof is invalid. |
+| 95 | `IssuerQuotaExhausted` | resource | yes | The issuer reached its registration quota; retry after the quota window rolls over. |
+| 96 | `LineageDepthMismatch` | malformed | no | The claimed lineage depth differs from the depth derived from its parents. |
+| 97 | `LineageFanOutSaturated` | resource | no | A parent reached `MAX_LINEAGE_FANOUT` registered children. |
 
 ## Privacy Rules
 
@@ -152,7 +163,7 @@ input, a different actor, or new evidence before the call can succeed.
 
 ## Compatibility And Migration
 
-- **Additive only.** Codes `1..=86` are frozen at this ABI version. A future change
+- **Additive only.** Codes `1..=97` are frozen at this ABI version. A future change
   that needs a new failure appends the next unused discriminant and adds a row here;
   it must not insert, reorder, or reuse a code.
 - **No storage impact.** The ABI describes revert values. It does not add storage
