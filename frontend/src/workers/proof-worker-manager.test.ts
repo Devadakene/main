@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ProofWorkerManager } from './proof-worker-manager'
+import {
+  ProofWorkerManager,
+  boundProofWorkerDiagnostic,
+  PROOF_WORKER_DIAGNOSTIC_MAX_BYTES,
+} from './proof-worker-manager'
 import { ProofWorkerLogger } from './proof-worker-logger'
 import type { ProofWorkerResponse } from './proof.worker.types'
 

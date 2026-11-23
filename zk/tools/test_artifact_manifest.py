@@ -1069,6 +1069,19 @@ def test_directories_without_a_package_file_are_not_circuits(tmp_path: Path):
     assert am.check_coverage(lock, tmp_path) == []
 
 
+def test_library_packages_are_not_treated_as_unpinned_circuits(tmp_path: Path):
+    _package(tmp_path, "real_circuit")
+    lib_dir = tmp_path / "zk" / "noir" / "harpocrates_common"
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    lib_dir.joinpath("Nargo.toml").write_text(
+        '[package]\nname = "harpocrates_common"\ntype = "lib"\n', encoding="utf-8"
+    )
+    lock = _lock_for(tmp_path, [_acir_entry("real_circuit")])
+
+    assert am.discover_circuit_packages(lock, tmp_path) == ["real_circuit"]
+    assert am.check_coverage(lock, tmp_path) == []
+
+
 def test_an_empty_circuit_root_is_not_a_coverage_failure(tmp_path: Path):
     """A repo with no Noir packages is not misreported as a gap."""
     lock = _lock_for(tmp_path, [])
@@ -1182,3 +1195,42 @@ def test_coverage_findings_never_contain_artifact_content(tmp_path: Path, monkey
     assert "AAA" not in captured
     assert "bytecode" not in captured
     assert "unpinned_circuit" in captured
+
+
+def test_digest_artifact_rejects_parent_traversal(tmp_path: Path, lock: am.Lock):
+    root = tmp_path / "release"
+    root.mkdir()
+    (tmp_path / "outside.bin").write_bytes(b"outside release")
+
+    declaration = {
+        "path": "../outside.bin",
+        "kind": "binary",
+        "role": "test",
+        "required": True,
+    }
+
+    with pytest.raises(am.ArtifactPathEscapeError):
+        am.digest_artifact(declaration, lock, root)
+
+
+def test_digest_artifact_rejects_symlink_escape(tmp_path: Path, lock: am.Lock):
+    root = tmp_path / "release"
+    root.mkdir()
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside release")
+
+    link = root / "artifact.bin"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlink creation is not supported in this environment")
+
+    declaration = {
+        "path": "artifact.bin",
+        "kind": "binary",
+        "role": "test",
+        "required": True,
+    }
+
+    with pytest.raises(am.ArtifactPathEscapeError):
+        am.digest_artifact(declaration, lock, root)
